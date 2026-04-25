@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd \"d:\\\\project\\\\demo\\\\1mg scrapper\" ; python -c \"\nfrom extractor import extract_medicine_details\nurl = 'https://www\\.1mg\\.com/drugs/zyzu-mr-100mg-4mg-tablet-909790'\nresult = extract_medicine_details\\(url\\)\nprint\\('Therapeutic Class:', repr\\(result\\.get\\('therapeutic_class'\\)\\)\\)\n\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

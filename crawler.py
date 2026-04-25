@@ -1,9 +1,11 @@
+import argparse
 import csv
 import string
 import time
 import json
 import os
 import requests
+import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,6 +49,87 @@ def save_state(state_file, state):
     with state_lock:
         with open(state_file, 'w') as f:
             json.dump(state, f)
+
+
+def fetch_xml(url, headers, timeout=15):
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
+
+
+def parse_sitemap_locs(xml_text):
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        print(f"Failed to parse sitemap XML: {e}")
+        return []
+
+    namespaces = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+    locs = []
+    for loc in root.findall('.//s:loc', namespaces):
+        if loc.text:
+            locs.append(loc.text.strip())
+    return locs
+
+
+def extract_urls_from_sitemap(sitemap_url, headers):
+    xml_text = fetch_xml(sitemap_url, headers)
+    return parse_sitemap_locs(xml_text)
+
+
+def crawl_sitemap_type(output_file, sitemap_index_url, sitemap_prefixes, path_keywords):
+    if isinstance(sitemap_prefixes, str):
+        sitemap_prefixes = [sitemap_prefixes]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        "Accept": "text/xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+
+    print(f"Fetching sitemap index: {sitemap_index_url}")
+    sitemap_urls = extract_urls_from_sitemap(sitemap_index_url, headers)
+    if not sitemap_urls:
+        print("No sitemap files found in index.")
+        return
+
+    matched_urls = []
+    for sitemap_url in sitemap_urls:
+        lower_sitemap_url = sitemap_url.lower()
+        if not any(prefix.lower() in lower_sitemap_url for prefix in sitemap_prefixes):
+            continue
+        print(f"Parsing sitemap: {sitemap_url}")
+        page_urls = extract_urls_from_sitemap(sitemap_url, headers)
+        for u in page_urls:
+            lower_u = u.lower()
+            if any(keyword in lower_u for keyword in path_keywords):
+                matched_urls.append(u)
+
+    matched_urls = sorted(set(matched_urls))
+    if not matched_urls:
+        print(f"No URLs found in sitemaps matching {path_keywords}.")
+        return
+
+    with open(output_file, mode='w', newline='', encoding='utf-8') as csv_file:
+        writer = csv.writer(csv_file)
+        for u in matched_urls:
+            writer.writerow([u])
+
+    print(f"Saved {len(matched_urls)} unique URLs to {output_file}")
+
+
+def crawl_otc_from_sitemap(output_file="otc_urls.csv", sitemap_index_url="https://www.1mg.com/sitemap.xml"):
+    return crawl_sitemap_type(output_file, sitemap_index_url, "sitemap_otc_", ["/otc/"])
+
+
+def crawl_drugs_from_sitemap(output_file="drugs_urls.csv", sitemap_index_url="https://www.1mg.com/sitemap.xml"):
+    # Includes both English and Hindi drug sitemap groups and both /drugs/ and /drug/ patterns.
+    return crawl_sitemap_type(
+        output_file,
+        sitemap_index_url,
+        ["sitemap_drugs_", "sitemap_hi_drugs_"],
+        ["/drugs/", "/drug/"]
+    )
 
 def crawl_letter(letter, start_page, state, state_file, output_file, max_pages=500):
     base_url = "https://www.1mg.com"
@@ -150,5 +233,24 @@ def crawl_1mg_urls(output_file="urls.csv", state_file="crawler_state.json", max_
                 
     print(f"Done crawling! URLs are saved in {output_file}")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="1mg scraper utility")
+    parser.add_argument("mode", choices=["drugs", "drugs-sitemap", "otc"], default="drugs", nargs="?",
+                        help="Choose 'drugs' to crawl products by alphabet, 'drugs-sitemap' to extract drug pages from sitemaps, or 'otc' to extract OTC pages from sitemap.")
+    parser.add_argument("--output", default=None, help="Output CSV file name")
+    parser.add_argument("--sitemap-index", default="https://www.1mg.com/sitemap.xml",
+                        help="URL of the 1mg sitemap index")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    crawl_1mg_urls()
+    args = parse_args()
+    if args.mode == "otc":
+        output_file = args.output or "otc_urls.csv"
+        crawl_otc_from_sitemap(output_file=output_file, sitemap_index_url=args.sitemap_index)
+    elif args.mode == "drugs-sitemap":
+        output_file = args.output or "drugs_urls.csv"
+        crawl_drugs_from_sitemap(output_file=output_file, sitemap_index_url=args.sitemap_index)
+    else:
+        output_file = args.output or "urls.csv"
+        crawl_1mg_urls(output_file=output_file)

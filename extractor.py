@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 import re
 import json
 import threading
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Thread lock to prevent multiple threads from writing to the CSV at the exact same microsecond
@@ -176,6 +177,61 @@ def extract_medicine_details(url):
                 container = feedback_node.parent.parent.parent
                 feedback = container.text.strip()
 
+            # 14. Storage
+            storage = ""
+            store_node = soup.find(string=re.compile('Store below', re.I))
+            if store_node:
+                storage = store_node.strip()
+
+            # 15. Quick Tips
+            quick_tips = []
+            tips_section = soup.find('div', string=re.compile('Quick tips', re.I))
+            if tips_section:
+                ul = tips_section.find_next('ul')
+                if ul:
+                    quick_tips = [li.text.strip() for li in ul.find_all('li')]
+
+            # 16. FAQs
+            faqs = {}
+            faq_headings = soup.find_all('h3')
+            for h3 in faq_headings:
+                question = h3.text.strip()
+                if question:
+                    answer_div = h3.find_next('p')
+                    if answer_div:
+                        faqs[question] = answer_div.text.strip()
+
+            # 17. References
+            references = []
+            ref_node = soup.find(string=re.compile('References', re.I))
+            if ref_node:
+                parent = ref_node.parent
+                if parent:
+                    ul = parent.find('ul')
+                    if ul:
+                        references = [li.text.strip() for li in ul.find_all('li')]
+
+            # 18. Marketer Details
+            marketer_details = {}
+            marketer_node = soup.find(string=re.compile('Marketer details', re.I))
+            if marketer_node:
+                parent_div = marketer_node.parent.parent
+                if parent_div:
+                    for row in parent_div.find_all('div', class_=re.compile('row')):
+                        key_node = row.find('div', class_=re.compile('key'))
+                        val_node = row.find('div', class_=re.compile('value'))
+                        if key_node and val_node:
+                            marketer_details[key_node.text.strip()] = val_node.text.strip()
+
+            # 19. Prescription Required
+            prescription_required = "Prescription Required" in html
+
+            # 20. Therapeutic Class (from Fact Box)
+            therapeutic_class = ""
+            pain_node = soup.find(string=re.compile('PAIN ANALGESICS', re.I))
+            if pain_node:
+                therapeutic_class = pain_node.strip()
+
             return {
                 "brand_name": brand_name,
                 "composition": composition,
@@ -191,6 +247,13 @@ def extract_medicine_details(url):
                 "side_effects": " | ".join(side_effects),
                 "substitutes": json.dumps(substitutes),
                 "user_feedback": feedback,
+                "storage": storage,
+                "quick_tips": " | ".join(quick_tips),
+                "faqs": json.dumps(faqs),
+                "references": json.dumps(references),
+                "marketer_details": json.dumps(marketer_details),
+                "prescription_required": prescription_required,
+                "therapeutic_class": therapeutic_class,
                 "error": ""
             }
 
@@ -263,7 +326,8 @@ def start_extraction(input_file="urls.csv", output_file="medicine_details.csv"):
             "url", "brand_name", "composition", "manufacturer", "price",
             "safety_advice", "fact_box", "drug_interactions", "product_intro",
             "how_it_works", "uses", "benefits", "side_effects", "substitutes",
-            "user_feedback", "error"
+            "user_feedback", "storage", "quick_tips", "faqs", "references",
+            "marketer_details", "prescription_required", "therapeutic_class", "error"
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
@@ -288,5 +352,12 @@ def start_extraction(input_file="urls.csv", output_file="medicine_details.csv"):
 
     print("Multi-Threaded extraction complete!")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="1mg medicine details extractor")
+    parser.add_argument("--input", default="urls.csv", help="Input CSV file with URLs")
+    parser.add_argument("--output", default="medicine_details.csv", help="Output CSV file for extracted data")
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    start_extraction()
+    args = parse_args()
+    start_extraction(input_file=args.input, output_file=args.output)
