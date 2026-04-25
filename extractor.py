@@ -1,6 +1,7 @@
 import csv
 import time
 import os
+import random
 import requests
 from bs4 import BeautifulSoup
 import re
@@ -9,10 +10,53 @@ import threading
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# --- Pre-compiled regex patterns (compiled once at import time, not per URL) ---
+RE_WARNING_TOP       = re.compile('DrugOverview__warning-top')
+RE_WARNING_TAG       = re.compile('DrugOverview__warning-tag')
+# Fact box: real class is DrugFactBox__*, not FactBox__*
+RE_FACT_BOX          = re.compile('DrugFactBox__content')
+RE_FACT_ROW          = re.compile('DrugFactBox__fact-row')
+RE_FACT_KEY          = re.compile('DrugFactBox__col-left')
+RE_FACT_VAL          = re.compile('DrugFactBox__col-right')
+RE_INTERACTION_WRAP  = re.compile('DrugInteraction__drug-interaction-wrapper')
+RE_INTERACTION_PANEL = re.compile('DrugInteraction__interaction-panel')
+RE_DRUG_NAME         = re.compile('DrugInteraction__drug-name')
+RE_SEVERITY          = re.compile('DrugInteraction__severity-text')
+RE_DRUG_DIV          = re.compile('DrugInteraction__drug___')
+RE_DESC_CONTENT      = re.compile('ProductDescription__description-content', re.I)
+RE_OVERVIEW_CONTENT  = re.compile('DrugOverview__content')
+RE_SUBSTITUTE_ITEM   = re.compile('SubstituteItem__item')
+RE_SUB_NAME          = re.compile('SubstituteItem__name')
+RE_SUB_MFR           = re.compile('SubstituteItem__manufacturer-name')
+RE_SUB_PRICE         = re.compile('SubstituteItem__price')
+RE_PRODUCT_INTRO     = re.compile('Product introduction', re.I)
+RE_HOW_WORKS         = re.compile('How .* works', re.I)
+RE_BENEFITS_OF       = re.compile('Benefits of', re.I)
+RE_ALL_SUBS          = re.compile('All substitutes', re.I)
+RE_USER_FEEDBACK     = re.compile('style__feedback-container')
+RE_STORE_BELOW       = re.compile('Store below', re.I)
+RE_REFERENCES        = re.compile('DrugPage__reference')
+RE_MARKETER          = re.compile('DrugPage__compliance-info-wrapper')
+RE_QUICK_TIPS        = re.compile('Quick tips', re.I)
+RE_PAIN              = re.compile('ANTI INFECTIVES', re.I)
+RE_INTERACTION_H2    = re.compile('interaction', re.I)
+RE_FAQ_TILE          = re.compile('Faqs__tile')
+RE_FAQ_QUES          = re.compile('Faqs__ques')
+RE_FAQ_ANS           = re.compile('Faqs__ans')
+RE_HOW_WORKS_H2      = re.compile('works', re.I)
+
 # Thread lock to prevent multiple threads from writing to the CSV at the exact same microsecond
 csv_lock = threading.Lock()
 processed_count = 0
 total_urls = 0
+
+# Thread-local storage for requests.Session
+thread_local = threading.local()
+
+def get_session():
+    if not hasattr(thread_local, "session"):
+        thread_local.session = requests.Session()
+    return thread_local.session
 
 def extract_medicine_details(url):
     headers = {
@@ -21,16 +65,19 @@ def extract_medicine_details(url):
         "Accept-Language": "en-US,en;q=0.5",
     }
     
+    session = get_session()
+    
     for attempt in range(3):
         try:
-            response = requests.get(url, headers=headers, timeout=15)
+            response = session.get(url, headers=headers, timeout=15)
             if response.status_code != 200:
                 print(f"HTTP {response.status_code} for {url}. Retrying...")
                 time.sleep(2)
                 continue
             
             html = response.text
-            soup = BeautifulSoup(html, "html.parser")
+            # Use lxml parser which is significantly faster than html.parser
+            soup = BeautifulSoup(html, "lxml")
 
             # 1. Brand Name
             title = soup.find('h1', class_='DrugHeader__title-content___2ZaPo')
@@ -59,81 +106,83 @@ def extract_medicine_details(url):
                 price_div = soup.find('div', class_=lambda x: x and 'DrugPriceBox__best-price___' in x)
             price = price_div.text.strip().replace('\u20b9', 'Rs. ') if price_div else ""
 
-            # 5. Safety Advice
+            # 5. Safety Advice — use pre-compiled patterns
             safety_data = {}
-            for warning in soup.find_all('div', class_=re.compile('DrugOverview__warning-top')):
+            for warning in soup.find_all('div', class_=RE_WARNING_TOP):
                 title_node = warning.find('span')
                 if title_node:
                     key = title_node.text.strip()
-                    status_node = warning.parent.find('div', class_=re.compile('DrugOverview__warning-tag'))
+                    status_node = warning.parent.find('div', class_=RE_WARNING_TAG)
                     status = status_node.text.strip() if status_node else ""
                     safety_data[key] = status
-            
-            # 6. Fact Box
+
+            # 6. Fact Box — real class is DrugFactBox__*, extracted as key/value pairs
             fact_box_data = {}
-            fact_box_section = soup.find('div', class_=re.compile('FactBox__fact-box'))
+            fact_box_section = soup.find('div', class_=RE_FACT_BOX)
             if fact_box_section:
-                for row in fact_box_section.find_all('div', class_=re.compile('FactBox__row')):
-                    key_node = row.find('div', class_=re.compile('FactBox__key'))
-                    val_node = row.find('div', class_=re.compile('FactBox__value'))
+                for row in fact_box_section.find_all('div', class_=RE_FACT_ROW):
+                    key_node = row.find('div', class_=RE_FACT_KEY)
+                    val_node = row.find('div', class_=RE_FACT_VAL)
                     if key_node and val_node:
                         fact_box_data[key_node.text.strip()] = val_node.text.strip()
 
-            # 7. Drug Interactions
+            # 7. Drug Interactions — use pre-compiled patterns
             interactions = []
-            interaction_section = soup.find('div', class_=re.compile('DrugInteraction__drug-interaction-wrapper'))
+            interaction_section = soup.find('div', class_=RE_INTERACTION_WRAP)
             if interaction_section:
-                 panels = interaction_section.find_all('div', class_=re.compile('DrugInteraction__interaction-panel'))
-                 for p in panels:
-                     drug_name = p.find('span', class_=re.compile('DrugInteraction__drug-name'))
-                     sev = p.find('span', class_=re.compile('DrugInteraction__severity-text'))
-                     if drug_name:
-                         interactions.append(f"{drug_name.text.strip()} ({sev.text.strip() if sev else ''})")
+                panels = interaction_section.find_all('div', class_=RE_INTERACTION_PANEL)
+                for p in panels:
+                    drug_name = p.find('span', class_=RE_DRUG_NAME)
+                    sev = p.find('span', class_=RE_SEVERITY)
+                    if drug_name:
+                        interactions.append(f"{drug_name.text.strip()} ({sev.text.strip() if sev else ''})")
             if not interactions:
                 for h2 in soup.find_all('h2'):
-                    if "interaction" in h2.text.strip().lower():
+                    if RE_INTERACTION_H2.search(h2.text):
                         parent_div = h2.parent
                         if parent_div:
                             next_div = parent_div.find_next_sibling('div')
                             if next_div:
-                                for drug_div in next_div.find_all('div', class_=lambda x: x and 'DrugInteraction__drug___' in x):
+                                for drug_div in next_div.find_all('div', class_=RE_DRUG_DIV):
                                     interactions.append(drug_div.text.strip())
                         break
 
-            # Helper for text sections
-            def get_text_after_heading(heading_regex):
-                for elem in soup.find_all(string=re.compile(heading_regex, re.I)):
+            # Helper for text sections — uses pre-compiled patterns passed in
+            def get_text_after_heading(pattern):
+                for elem in soup.find_all(string=pattern):
                     parent_div = elem.parent.parent
                     if parent_div:
-                        content_div = parent_div.find('div', class_=re.compile("ProductDescription__description-content", re.I))
+                        content_div = parent_div.find('div', class_=RE_DESC_CONTENT)
                         if content_div:
                             return content_div.text.strip()
                         return parent_div.text.strip()
                 return ""
-            
+
             # 8. Product Intro
-            product_intro = get_text_after_heading('Product introduction')
+            product_intro = get_text_after_heading(RE_PRODUCT_INTRO)
 
             # 9. How it works
-            how_it_works = get_text_after_heading('How .* works')
+            how_it_works = get_text_after_heading(RE_HOW_WORKS)
 
             # 10. Uses & Benefits
             uses = []
-            benefits_text = get_text_after_heading('Benefits of')
-            
-            # 11. Side Effects
+            benefits_text = get_text_after_heading(RE_BENEFITS_OF)
+
+            # 11. Side Effects — use pre-compiled pattern
             side_effects = []
-            overview_sections = soup.find_all('div', class_=lambda x: x and 'DrugOverview__content___' in x)
+            overview_sections = soup.find_all('div', class_=RE_OVERVIEW_CONTENT)
             for section in overview_sections:
                 heading = section.find('h2')
                 heading_text = heading.text.strip().lower() if heading else ""
                 if "uses of" in heading_text:
                     ul = section.find('ul')
-                    if ul: uses = [li.text.strip() for li in ul.find_all('li')]
+                    if ul:
+                        uses = [li.text.strip() for li in ul.find_all('li')]
                 elif "side effects" in heading_text:
                     ul = section.find('ul')
-                    if ul: side_effects = [li.text.strip() for li in ul.find_all('li')]
-            
+                    if ul:
+                        side_effects = [li.text.strip() for li in ul.find_all('li')]
+
             # Fallback for Uses/Side Effects
             if not uses:
                 for h2 in soup.find_all('h2'):
@@ -162,75 +211,85 @@ def extract_medicine_details(url):
                                 side_effects = [li.text.strip() for li in ul.find_all('li')]
                         break
 
-            # 12. Substitutes
+            # 12. Substitutes — use SubstituteItem__item and sub-divs for name/mfr/price
             substitutes = []
-            subs_node = soup.find(string=re.compile('All substitutes', re.I))
-            if subs_node and subs_node.parent and subs_node.parent.parent and subs_node.parent.parent.parent:
-                subs_container = subs_node.parent.parent.parent
-                for s in subs_container.find_all('div', class_=re.compile('SubstituteItem')):
-                    substitutes.append(s.text.strip())
+            for s in soup.find_all('div', class_=RE_SUBSTITUTE_ITEM):
+                name_div  = s.find('div', class_=RE_SUB_NAME)
+                mfr_div   = s.find('div', class_=RE_SUB_MFR)
+                price_div_s = s.find('div', class_=RE_SUB_PRICE)
+                if name_div:
+                    name_text  = name_div.text.strip()
+                    mfr_text   = mfr_div.text.strip()   if mfr_div   else ""
+                    price_text = price_div_s.text.strip() if price_div_s else ""
+                    # clean rupee symbol from price
+                    price_text = price_text.replace('\u20b9', 'Rs. ')
+                    substitutes.append(f"{name_text} | {mfr_text} | {price_text}")
 
-            # 13. User Feedback
+            # 13. User Feedback — use the real style__feedback-container class
             feedback = ""
-            feedback_node = soup.find(string=re.compile('User feedback', re.I))
-            if feedback_node and feedback_node.parent and feedback_node.parent.parent and feedback_node.parent.parent.parent:
-                container = feedback_node.parent.parent.parent
-                feedback = container.text.strip()
+            fb_div = soup.find('div', class_=RE_USER_FEEDBACK)
+            if fb_div:
+                feedback = fb_div.get_text(' | ', strip=True)[:500]
 
             # 14. Storage
             storage = ""
-            store_node = soup.find(string=re.compile('Store below', re.I))
+            store_node = soup.find(string=RE_STORE_BELOW)
             if store_node:
                 storage = store_node.strip()
 
-            # 15. Quick Tips
+            # 15. Quick Tips — find the heading text node, then walk up to the section container
             quick_tips = []
-            tips_section = soup.find('div', string=re.compile('Quick tips', re.I))
-            if tips_section:
-                ul = tips_section.find_next('ul')
-                if ul:
-                    quick_tips = [li.text.strip() for li in ul.find_all('li')]
-
-            # 16. FAQs
-            faqs = {}
-            faq_headings = soup.find_all('h3')
-            for h3 in faq_headings:
-                question = h3.text.strip()
-                if question:
-                    answer_div = h3.find_next('p')
-                    if answer_div:
-                        faqs[question] = answer_div.text.strip()
-
-            # 17. References
-            references = []
-            ref_node = soup.find(string=re.compile('References', re.I))
-            if ref_node:
-                parent = ref_node.parent
-                if parent:
-                    ul = parent.find('ul')
+            tips_node = soup.find(string=RE_QUICK_TIPS)
+            if tips_node:
+                # Walk up until we find a container that has a <ul> with actual tip content
+                tips_section = tips_node.parent
+                for _ in range(6):  # max 6 levels up
+                    if tips_section is None:
+                        break
+                    ul = tips_section.find('ul')
                     if ul:
-                        references = [li.text.strip() for li in ul.find_all('li')]
+                        items = [li.text.strip() for li in ul.find_all('li') if len(li.text.strip()) > 15]
+                        if items:  # only accept if items look like real tips (not nav links)
+                            quick_tips = items
+                            break
+                    tips_section = tips_section.parent
 
-            # 18. Marketer Details
+            # 16. FAQs — use real Faqs__tile/ques/ans class names
+            faqs = {}
+            for tile in soup.find_all('div', class_=RE_FAQ_TILE):
+                q_node = tile.find('h3', class_=RE_FAQ_QUES)
+                a_node = tile.find('div', class_=RE_FAQ_ANS)
+                if q_node:
+                    faqs[q_node.text.strip()] = a_node.text.strip() if a_node else ""
+
+            # 17. References — use real DrugPage__reference ol tag
+            references = []
+            ref_ol = soup.find('ol', class_=RE_REFERENCES)
+            if ref_ol:
+                references = [li.text.strip() for li in ref_ol.find_all('li') if li.text.strip()]
+
+            # 18. Marketer Details — use DrugPage__compliance-info-wrapper
             marketer_details = {}
-            marketer_node = soup.find(string=re.compile('Marketer details', re.I))
-            if marketer_node:
-                parent_div = marketer_node.parent.parent
-                if parent_div:
-                    for row in parent_div.find_all('div', class_=re.compile('row')):
-                        key_node = row.find('div', class_=re.compile('key'))
-                        val_node = row.find('div', class_=re.compile('value'))
-                        if key_node and val_node:
-                            marketer_details[key_node.text.strip()] = val_node.text.strip()
+            marketer_div = soup.find('div', class_=RE_MARKETER)
+            if marketer_div:
+                # Pairs of label/value divs inside the wrapper
+                texts = [t.strip() for t in marketer_div.stripped_strings]
+                # texts looks like: ['Name:', 'Glaxo SmithKline...', 'Address:', '...', ...]
+                for i in range(0, len(texts) - 1, 2):
+                    key = texts[i].rstrip(':')
+                    val = texts[i + 1]
+                    if key and val:
+                        marketer_details[key] = val
 
-            # 19. Prescription Required
+            # 19. Prescription Required — plain string search in raw HTML (fastest)
             prescription_required = "Prescription Required" in html
 
             # 20. Therapeutic Class (from Fact Box)
-            therapeutic_class = ""
-            pain_node = soup.find(string=re.compile('PAIN ANALGESICS', re.I))
-            if pain_node:
-                therapeutic_class = pain_node.strip()
+            therapeutic_class = fact_box_data.get("Therapeutic Class", "")
+            if not therapeutic_class:
+                pain_node = soup.find(string=RE_PAIN)
+                if pain_node:
+                    therapeutic_class = pain_node.strip()
 
             return {
                 "brand_name": brand_name,
@@ -285,20 +344,23 @@ def load_processed_urls(output_file="medicine_details.csv"):
 
 def process_single_url(url, writer, csvfile):
     global processed_count
-    
+
+    # Random jitter: prevents all threads from firing requests in synchronized bursts
+    time.sleep(random.uniform(0.1, 0.5))
+
     result = extract_medicine_details(url)
     result["url"] = url
-    
+
     # Use threading lock to prevent CSV corruption from concurrent writes
     with csv_lock:
         writer.writerow(result)
-        csvfile.flush()
         processed_count += 1
+        # Flush every 50 records to reduce disk I/O overhead
+        if processed_count % 50 == 0:
+            csvfile.flush()
         print(f"[{processed_count}/{total_urls}] Extracted: {url}")
-        
-    time.sleep(1) # Small 1s delay per thread as a precaution
 
-def start_extraction(input_file="urls.csv", output_file="medicine_details.csv"):
+def start_extraction(input_file="drugs_urls.csv", output_file="medicine_details.csv"):
     global total_urls
     global processed_count
     
@@ -335,8 +397,11 @@ def start_extraction(input_file="urls.csv", output_file="medicine_details.csv"):
             writer.writeheader()
 
         # Execute Multi-Threaded Queue
-        # We start with 5 threads. This runs 5 simultaneous jobs.
-        max_threads = 100
+        # 15 threads is the sweet spot for a single domain:
+        # - Enough concurrency to saturate network I/O
+        # - Not so many that 1mg rate-limits/throttles you (causing slow retries)
+        # - Old code used 100 threads → triggered rate limiting → each retry = +6s per URL
+        max_threads = 15
         print(f"Starting multi-threaded extraction using {max_threads} concurrent threads...")
         
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
