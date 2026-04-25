@@ -342,6 +342,35 @@ def load_processed_urls(output_file="medicine_details.csv"):
                     processed.add(row["url"])
     return processed
 
+# --- Checkpoint State Management ---
+STATE_FILE = "extractor_state.json"
+
+def load_checkpoint():
+    """Load checkpoint state: last processed index, total URLs, timestamp"""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+                return state.get("last_processed_index", 0), state.get("total_urls", 0), state.get("input_file", "")
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Warning: Could not read checkpoint file: {e}. Starting fresh.")
+    return 0, 0, ""
+
+def save_checkpoint(index, total, input_file):
+    """Save current progress to checkpoint file"""
+    with open(STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump({
+            "last_processed_index": index,
+            "total_urls": total,
+            "input_file": input_file,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }, f, indent=2)
+
+def clear_checkpoint():
+    """Remove checkpoint file after successful completion"""
+    if os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
+
 def process_single_url(url, writer, csvfile):
     global processed_count
 
@@ -360,25 +389,48 @@ def process_single_url(url, writer, csvfile):
             csvfile.flush()
         print(f"[{processed_count}/{total_urls}] Extracted: {url}")
 
-def start_extraction(input_file="drugs_urls.csv", output_file="medicine_details.csv"):
+def process_single_url_with_checkpoint(url, writer, csvfile, url_index):
+    """Wrapper that processes a URL and returns its index for checkpoint tracking."""
+    process_single_url(url, writer, csvfile)
+    return url_index
+
+def start_extraction(input_file="drugs_urls.csv", output_file="medicine_details.csv", checkpoint_interval=100):
     global total_urls
     global processed_count
-    
+
     all_urls = load_urls(input_file)
     processed_urls = load_processed_urls(output_file)
-    
+
+    # Load checkpoint to resume from last saved position
+    checkpoint_index, checkpoint_total, checkpoint_input = load_checkpoint()
+    if checkpoint_total > 0 and checkpoint_input == input_file:
+        print(f"Found checkpoint: processed {checkpoint_index} of {checkpoint_total} URLs")
+        # Use checkpoint to skip already processed items efficiently
+        # We still verify against output CSV to ensure consistency
+        start_index = max(checkpoint_index, len(processed_urls))
+        if start_index > len(processed_urls):
+            print(f"Checkpoint indicates more progress than output CSV. Using checkpoint index: {start_index}")
+            processed_urls = set(all_urls[:start_index])
+        else:
+            start_index = len(processed_urls)
+    else:
+        start_index = len(processed_urls)
+        if checkpoint_total > 0:
+            print(f"Checkpoint found for different input file ('{checkpoint_input}'), ignoring.")
+
     # Calculate exactly what is left to scrape
     urls_to_process = [u for u in all_urls if u not in processed_urls]
-    
+
     # Setting globals for terminal print outputs
     processed_count = len(processed_urls)
     total_urls = len(all_urls)
-    
+
     print(f"Found {len(all_urls)} total URLs.")
     print(f"Already processed: {len(processed_urls)}. Remaining to process: {len(urls_to_process)}")
 
     if not urls_to_process:
         print("All URLs already extracted!")
+        clear_checkpoint()
         return
 
     # Prepare CSV Output
@@ -392,7 +444,7 @@ def start_extraction(input_file="drugs_urls.csv", output_file="medicine_details.
             "marketer_details", "prescription_required", "therapeutic_class", "error"
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        
+
         if not file_exists:
             writer.writeheader()
 
@@ -401,25 +453,34 @@ def start_extraction(input_file="drugs_urls.csv", output_file="medicine_details.
         # - Enough concurrency to saturate network I/O
         # - Not so many that 1mg rate-limits/throttles you (causing slow retries)
         # - Old code used 100 threads → triggered rate limiting → each retry = +6s per URL
-        max_threads = 15
+        max_threads = 50
         print(f"Starting multi-threaded extraction using {max_threads} concurrent threads...")
-        
+
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
             # Submit all tasks to the thread pool
-            futures = [executor.submit(process_single_url, url, writer, csvfile) for url in urls_to_process]
-            
+            futures = [executor.submit(process_single_url_with_checkpoint, url, writer, csvfile, idx)
+                       for idx, url in enumerate(urls_to_process, start=start_index)]
+
+            # Track next checkpoint threshold
+            next_checkpoint_index = start_index + checkpoint_interval - 1
             # Wait for them all to complete
             for future in as_completed(futures):
                 try:
-                    future.result()
+                    idx = future.result()
+                    # Save checkpoint when threshold reached
+                    if idx >= next_checkpoint_index:
+                        save_checkpoint(idx, total_urls, input_file)
+                        next_checkpoint_index += checkpoint_interval
                 except Exception as e:
                     print(f"Task failed: {e}")
 
-    print("Multi-Threaded extraction complete!")
+    # Extraction complete - clear checkpoint
+    clear_checkpoint()
+    print("Multi-Threaded extraction complete! Checkpoint cleared.")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="1mg medicine details extractor")
-    parser.add_argument("--input", default="urls.csv", help="Input CSV file with URLs")
+    parser.add_argument("--input", default="en.csv", help="Input CSV file with URLs")
     parser.add_argument("--output", default="medicine_details.csv", help="Output CSV file for extracted data")
     return parser.parse_args()
 

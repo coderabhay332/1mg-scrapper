@@ -1,1 +1,6 @@
-{"index": 0}
+{
+  "last_processed_index": 456,
+  "total_urls": 383262,
+  "input_file": "en.csv",
+  "timestamp": "2026-04-25 18:01:45"
+}
